@@ -1,350 +1,334 @@
 (function(w, undefined) {
 
-	// A common Simple Reactive atom with just the fundamentals
-	var Atom = function(opt) {
-		this.NEXT = [];
-		this.OPT = opt || {};
-		this.STARTED = false;
-		this.ME = undefined;
-		this.CTX = undefined;
-
-		if (this.OPT.event) {
-			this.event = this.OPT.event;
-		}
-
-		if (this.OPT.error) {
-			this.error = this.OPT.error;
-		}
-
-		if (this.OPT.parent) {
-			parent.chain(this);
-		}
-
-		if (this.OPT.context) {
-			this.CTX = this.OPT.context;
-		}
+	w.SRx = function(src, ctx) {
+		var t = this;
+		this.source = src;
+		this.ctx = ctx || {};
+		this.running = false;
 		
-		if (this.OPT.init) {
-			this.OPT.init.call(this);
+		this._ = {
+			event: [],
+			start: [],
+			end: [],
+			error: [],
 		}
 
-	};
+		if (typeof src === 'function') {
+			var t = this;
+			src.call(t, t.event.bind(t, ctx));
+		}
+		else if (src instanceof Array) {
+			t.start(ctx);
+			src.forEach(t.event.bind(t, ctx));
+			t.end(ctx);
+		}
+		else if (src instanceof SRx) {
+			this.source = src.source;
+			src.onError(function(c, err) {t.error(c, err)});
+			src.onStart(function(c) {t.start(c)});
+			src.onEvent(function(c, ev) {t.event(c, ev)});
+			src.onEnd(function(c) {t.end(c)});
+		}
+		else if (src instanceof WebSocket) {
+			if (src.readyState === WebSocket.OPEN)
+				t.start(ctx);
+			src.onopen(t.start.bind(t, ctx));
+			src.onclose(t.end.bind(t, ctx));
+			src.onmessage(t.event.bind(t, ctx));
+			src.onerror(t.error.bind(t, ctx));
+		}
+		else if (src.then) {
+			// Assume it's a promise
+		}
+		else if (src.hasNext && src.next) {
+			// Assume an iterator
+		}
+		else if (typeof src.on === 'function') {
+			var t = this;
+			t.on = function(ev) {
+				src.on(ev, t.event.bind(t, ctx));
+				return t;
+			}
+		}
+		else {
+			throw new Error('src is not a valid simple-reactive target');
+		}
+	}
 
-	// Basic atomic functionality
-	Atom.fn = Atom.prototype = {
-		chain: function(atom) {
-			this.NEXT.push(atom);
-			if (this.STARTED)
-				atom.begin(this.CTX, this.ME);
-			return atom;
+	w.SRx.fn = w.SRx.prototype = {
+		error: function(ctx, err) {
+			var t = this;
+			t._.error.forEach(function(fn) {fn.call(t, ctx, err)});
+			return this;
 		},
 
-		unchain: function(atom) {
+		event: function(ctx, ev) {
+			var t = this;
+			if (!this.running)
+				t.start(ctx);
 			
+			t._.event.forEach(function(fn) {fn.call(t, ctx, ev)});
+			return this;
+		},
+
+		start: function(ctx) {
+			var t = this;
+			if (!this.running) {
+				this.running = true;
+				t._.start.forEach(function(fn) {fn.call(t, ctx)});
+			}
+			return this;
+		},
+
+		end: function(ctx) {
+			var t = this;
+			if (this.running) {
+				this.running = false;
+				t._.end.forEach(function(fn) {fn.call(t, ctx)});
+			}
+			return this;
 		},
 		
-		begin: function(ctx, me) {
-			this.ME = me;
-			this.CTX = ctx;
-			this.STARTED = true;
-			var fn = function() {this.NEXT.forEach(function(i) {i.begin(ctx, me)})}
-			if (!this.OPT.begin || this.OPT.begin(ctx, me, fn))
-				fn();
+		on: function() {return this},
+
+		onEvent: function(fn) {this._.event.push(fn); return this;},
+		onError: function(fn) {this._.error.push(fn); return this;},
+		onStart: function(fn) {this._.start.push(fn); return this;},
+		onEnd:   function(fn) {this._.end.push(fn); return this;},
+
+		async: function(delay) {
+			var n = new SRx(this, this.ctx);
+			var fn = n.event;
+			delay = delay || 0;
+			
+			n.event = function(ctx, ev) {
+				var t = this;
+				setTimeout(function(){
+					fn.call(t, ctx, ev)}, delay);
+				return t;
+			}
+			return n;
 		},
 
-		end: function(ctx, me) {
-			this.NEXT.forEach(function(i) {i.end(ctx, me)});
-
-			this.STARTED = false;
-			this.ME = undefined;
-			this.CTX = undefined;
-		},
-		
-		event: function(ev, ctx, me) {
-			this.NEXT.forEach(function(i) {i.event(ev, ctx, me)});
-		},
-
-		error: function(err, ctx, me) {
-			this.NEXT.forEach(function(i) {i.error(err, ctx, me)});
+		asyncFn: function(delayFn) {
+			var n = new SRx(this, this.ctx);
+			var fn = n.event;
+			n.event = function(ctx, ev) {
+				var t = this;
+				setTimeout(function(){
+					fn.call(t, ctx, ev)}, delayFn.call(t, ctx, ev));
+				return t;
+			}
+			return n;
 		},
 
-		reset: function(ctx, me) {
-			this.NEXT.forEach(function(i) {i.reset(ctx, me)});
+		throttle: function(delay) {
+			var n = new SRx(this, this.ctx);
+			var lastTime = 0;
+			var evFn = n.event;
+			var lastEv;
+			var timeout;
+			
+			n.event = function(ctx, ev) {
+				var t = this;
+				lastEv = ev;
+				var now = new Date().getTime();
+				var del = now - lastTime;
+				if (!timeout) {
+					timeout = setTimeout(function() {
+						evFn.call(t, ctx, lastEv);
+						lastTime = now;
+						timeout = undefined;
+					}, delay);
+				}
+				return t;
+			}
+			return n;
 		},
 
-		filter: function(fn){
-			var m;
-			var t = this.chain(new Atom({
-				event: function(ev, ctx, me) {
-					m = me;
-					if (fn(ev, ctx, tfn, me)) {
-						this.NEXT.forEach(function(i) {i.event(ev, ctx, me)});
-					}
-				},
-			}));
-			var tfn = function(ev, ctx) {t.NEXT.forEach(function(i) {i.event(ev, m, ctx)})};
-			return t;
-		},
-		
-		onEvent: function(fn){
-			return this.chain(new Atom({
-				event: function(ev, ctx, me) {
-					fn(ev, ctx, me);
-					this.NEXT.forEach(function(i) {i.event(ev, ctx, me)})
-				},
-			}))
-		},
-		
-		onError: function(fn){
-			return this.chain(new Atom({
-				error: function(err, ctx, me) {
-					fn(err, ctx, me);
-					this.NEXT.forEach(function(i) {i.error(err, ctx, me)})
-				},
-			}))
-		},
+		timeout: function(timeout, obj) {
+			var n = new SRx(this, this.ctx);
+			var evFn = n.event;
+			var startFn = n.start;
+			var endFn = n.end;
+			var errFn = n.error;
+			var timeout;
+			
+			n.start = function(ctx) {
 
-		map: function(fn){
-			return this.chain(new Atom({
-				event:  function(ev, ctx, me) {
-					var v = fn(ev, ctx, me);
-					this.NEXT.forEach(function(i) {i.event(v, ctx, me)})
-				},
-			}))
-		},
+			}
 
-		reduce: function(fn){
-			return this.chain(new Atom({
-				begin: function(ctx, me) {
-					this.REDUCE_VAL = undefined;
-				},
-				event: function(ev, ctx, me) {
-					this.REDUCE_VAL =  fn(this.REDUCE_VAL, ev, ctx, me);
-				},
-				end: function(ctx, me) {
-					var val = this.REDUCE_VAL;
-					this.NEXT.forEach(function(i) {i.event(val, ctx, me)})
-				},
-			}))
-		},
+			n.event = function(ctx, ev) {
+				var t = this;
+				
+				evFn.call(t, ctx, ev);
+				
+				if (timeout)
+					clearTimeout(timeout);
 
-		async: function(delay){
-			return this.chain(new Atom({
-				event: function(value, ctx, me) {
-					var t = this;
-					delay = delay || 0;
-					setTimeout(
-						function() {t.NEXT.forEach(function(i) {i.event(value, ctx, me)})},
-						delay);
-				},
-			}))
-		},
+				timeout = setTimeout(function() {
+					timeout = undefined;
+					t.end.call(t, ctx);
+				});
+			}
 
-		timeout: function(fn, delay) {
-			var to = delay || 10 * 1000; // 10s
-			var id;
-			return this.chain(new Atom({
-				begin: function() {
-					id = setTimeout(fn, delay);
-				},
-
-				event: function(ev, ctx, me) {
-					if (id)
-						clearTimeout(id);
-
-					this.NEXT.forEach(function(i) {i.event(val, ctx, me)})
-					id = setTimeout(fn, delay);
-				},
-
-				end: function() {
-					if (id)
-						clearTimeout(id);
-				},
-			}))
-		},
-
-		each: function() {
-			var targets;
-			return this.chain(new Atom({
-				init: function() {
-					targets = this.NEXT;
-				},
-				event: function(ev, ctx, me) {
-					// TODO: Throw and exception if ev is not an array
-					targets.forEach(function(i) {i.begin(ctx, me)});
-					ev.forEach(function(val) {
-						targets.forEach(function(i) {i.event(val, ctx, me)});
-					});
-					targets.forEach(function(i) {i.end(ctx, me)});
-				},
-			}));
+			n.end = function(ctx) {
+				if (timeout) {
+					clearTimeout(timeout);
+					timeout = undefined;
+				}
+				endFn.call(this, ctx);
+			}
 		},
 		
+		reduce: function(obj) {
+			var n = new SRx(this, this.ctx);
+			var evFn = n.event;
+			var startFn = n.start;
+			var endFn = n.end;
+			var errFn = n.error;
+			
+			var result;
+
+			if (typeof obj === 'function')
+				var reduce = {event: obj}
+			else
+				var reduce = obj;
+			
+			n.event = function(ctx, ev) {
+				result = reduce.event(ctx, res, ev);
+				return this;
+			}
+
+			n.start = function(ctx) {
+				result = undefined;
+				startFn.call(this, ctx);
+				return this;
+			}
+
+			n.end = function(ctx) {
+				evFn.call(this, ctx, result);
+				endFn.call(this, ctx);
+				return this;
+			}
+			return n;
+		},
+
+		filter: function(obj) {
+			var n = new SRx(this, this.ctx);
+			var evFn = n.event;
+			if (typeof obj === 'function')
+				var f = {filter: obj.bind(this)}
+			else
+				var f = obj;
+
+			n.event = function(ctx, ev) {
+				var t = this;
+				if (f.filter(ctx, ev))
+					return evFn.call(t, ctx, ev);
+				return t;
+			}
+
+			return n;
+		},
+
+		map: function(fn) {
+			var n = new SRx(this, this.ctx);
+			var evFn = n.event;
+			
+			n.event = function(ctx, ev) {
+				var t = this;
+				return evFn.call(t, ctx, fn.call(t, ctx, ev));
+			}
+
+			return n;
+		},
+
+		route: function(fn, obj) {
+			var n = new SRx(this, this.ctx);
+			var evFn = n.event;
+
+			if (fn instanceof RegExp) {
+				var regex = fn;
+				fn = function(ctx, ev) {
+					return ('' + ev).match(regex);
+				}
+			}
+			
+			if (typeof obj === 'function')
+				var dest = {event: obj}
+			else
+				var dest = obj;
+			
+			n.event = function(ctx, ev) {
+				var t = this;
+				if (fn.call(t, ctx, ev)) {
+					dest.event(ctx, ev);
+				}
+				evFn.call(t, ctx, ev);
+			}
+
+			return n;
+		},
+
 		tee: function(obj) {
-			// TODO: Throw an exception when obj doesn't accept events
-			this.chain(obj);
+			this.onError(function(c, err) {obj.error(c, err)});
+			this.onStart(function(c) {obj.start(c)});
+			this.onEvent(function(c, ev) {obj.event(c, ev)});
+			this.onEnd(function(c) {obj.end(c)});
+
 			return this;
 		},
 
 		merge: function(obj) {
-			// TODO: Throw an exception when obj doesn't chain
-			obj.chain(this);
-			return this;
-		},
-
-		source: function(obj, ctx) {
 			var t = this;
-			if (obj instanceof Array) {
-				setTimeout(function() {
-					obj.forEach(function(i) {t.event(i, ctx, t)})
-				}, 0);
-			}
-			else if (typeof obj == 'function') {
-				obj(function(ev){t.event(ev, ctx, undefined)});
-				
-			}
-			else if (obj instanceof Object && obj != null) {
-				if (obj.chain && obj.NEXT) {
-					// Treat it like an SRx object
-					obj.chain(t);
-				}
-				
-				else if (typeof obj.then == 'function') {
-					// Seems like it's probably a promise
-					setTimeout(function() {
-						obj.then(
-							function(ev){
-								t.event(ev, ctx, t);
-								t.end(ctx, t);
-							},
-							function(ev){
-								t.error(ev, ctx, t);
-								t.end(ctx, t);
-							}), 0});
-				}
-				else {
-					
-				}
-			}
-			else if (typeof obj == 'string') {
-			}
-			else if (typeof obj == 'number') {
-			}
-			else if (typeof obj == 'boolean') {
-			}
-			else {
-			}
-			
+			obj.onError(function(c, err) {t.error(c, err)});
+			obj.onStart(function(c) {t.start(c)});
+			obj.onEvent(function(c, ev) {t.event(c, ev)});
+			obj.onEnd(function(c) {t.end(c)});
+
+			return this;
+		},
+
+		inject: function(ev) {
+			this.event(this.ctx, ev);
 		},
 	}
-
-    //----------------------------------------------------------------------//	
-	w.SRx = function(obj, ctx) {
-		Atom.call(this, {
-			context: ctx,
-		});
-
-		var t = this;
-		t._ = {};
-		t.NAME = 'SRx';
-		t.event = Atom.fn.event.bind(this);
-
-		ctx = ctx || {};
-		t.source(obj, ctx);
-	};
-	
-	Atom.fn.SRx = function(obj, ctx) {return new SRx(obj, ctx)}
-	
-	Atom.fn.throttle = function(delay, reset) {
-		var tid;
-		var val;
-		return this.filter(function(ev, ctx, fn, me) {
-			val = ev;
-			if (reset) {
-				clearTimeout(tid);
-				tid = undefined;
-			}
-			if (!tid) {
-				tid = setTimeout(function(){
-					clearTimeout(tid);
-					tid = undefined;
-					fn(val, ctx, me)
-				}, delay);
-			}
-			return false;
-		});
-	}
-
-	Atom.fn.skipN = function(skip) {
-		var n = 0;
-		return this.filter(function(ev, ctx, fn, me) {
-			if (n++ >= skip) {
-				n = 0;
-				return true;
-			}
-			else
-				return false;
-		});
-	}
-
-	Atom.fn.gate = function(opt) {
-		var all_events = false;
-		var begin_and_end = false;
-		var open = false;
-		// Parse options
-		if (typeof opt === 'Object') {
-			all_events = opt.all_events;
-			begin_and_end = opt.begin_and_end;
-		}
-		else {
-			all_events = opt;
-		}
-		
-		var gate = this.filter(function() {
-			return open;
-		});
-
-		var targets = gate.NEXT;
-		gate.open = function(ev, ctx, fn, me) {
-			open = true;
-			if (begin_and_end)
-				targets.forEach(function(i) {i.begin(ctx, me)});
-			if (all_events && ev)
-				this.event(ev);
-			return this;
-		}.bind(gate);
-
-		gate.close = function(ev, ctx, fn, me) {
-			if (all_events && ev)
-				this.event(ev);
-			if (begin_and_end)
-				targets.forEach(function(i) {i.end(ctx, me)});
-			open = false;
-			return this;
-		}.bind(gate);
-
-		gate.closeFn = function(fn) {
-			fn(gate.close);
-			return this;
-		}.bind(gate);
-		
-		gate.openFn = function(fn) {
-			fn(gate.open);
-			return this;
-		}.bind(gate);
-		
-		if (opt.open_fn)
-			opt.open_fn(gate.open);
-
-		if (opt.close_fn)
-			opt.close_fn(gate.close);
-		
-		return gate;
-	}
-
-	
-	
-	SRx.fn = w.SRx.prototype = Object.create(Atom.prototype);
-	SRx.fn.Atom = Atom;
-
 }(window));
+
+//----------------------------------------------------------------------//
+function srx_init() {
+	var Gate = function(state) {
+		this.isOpen = state;
+	}
+
+	Gate.fn = Gate.prototype = {
+		open: function() {this.isOpen = true},
+		close: function() {this.isOpen = false},
+		filter: function() {return this.isOpen},
+	}
+
+	var gate = new Gate(false);
+	
+	var src = $('.grid');
+	var dest = $('.output');
+		   
+	var srx = new SRx($('.grid'))
+		.on('mousedown mousemove')
+		.throttle(1000)
+		.filter(gate)
+		.onEvent(function(ctx, ev) {
+			dest.html('X: ' + ev.clientX + ' Y: ' + ev.clientY);
+		});
+
+	src.on('mousedown',
+		   function(ev) {
+			   gate.open();
+		   });
+	src.on('mouseup', function(ev) {srx.inject(ev); gate.close()});
+}
+
+
+(function() {
+	setTimeout(srx_init, 0);
+}());
